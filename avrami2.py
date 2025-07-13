@@ -199,7 +199,9 @@ def update_graph(model, n_av, k_av, T_we, b_we, A_sbm, Ea_sbm, T_sbm, m_sbm, n_s
     elif model == 'weibull':
         t_model, y_model = calculate_weibull(T_we, b_we)
     elif model == 'sbm':
-        t_model, y_model = calculate_sbm(A_sbm, Ea_sbm, T_sbm, m_sbm, n_sbm)
+        # Pastikan input tidak None sebelum kalkulasi
+        if all(v is not None for v in [A_sbm, Ea_sbm, T_sbm, m_sbm, n_sbm]):
+            t_model, y_model = calculate_sbm(A_sbm, Ea_sbm, T_sbm, m_sbm, n_sbm)
 
     fig.add_trace(go.Scatter(
         x=t_model, y=y_model, mode='lines', name=f'Model ({model.upper()})',
@@ -232,5 +234,5 @@ def update_graph(model, n_av, k_av, T_we, b_we, A_sbm, Ea_sbm, T_sbm, m_sbm, n_s
 # Menjalankan Aplikasi
 # =============================================================================
 if __name__ == '__main__':
-    app.run_server(debug=True)
+    app.run(debug=True)
 
