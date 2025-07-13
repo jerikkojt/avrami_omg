@@ -1,21 +1,22 @@
-import streamlit as st
+import dash
+from dash import dcc, html, Input, Output, State
+import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 from scipy.integrate import solve_ivp
-import matplotlib.pyplot as plt
 import io
+import base64
 
 # =============================================================================
-# Konfigurasi Halaman & Judul
+# Inisialisasi Aplikasi Dash
 # =============================================================================
-st.set_page_config(layout="wide", page_title="Universal Kinetic Modeler")
-st.title("🔬 Universal Kinetic Modeler")
-st.write("Aplikasi web interaktif untuk memodelkan data kinetik transformasi. Dibuat oleh JeryThom.")
+app = dash.Dash(__name__)
+server = app.server # Baris ini penting untuk deployment di platform seperti Heroku/Render
 
 # =============================================================================
-# Data Contoh (dari file 1 Normalized.csv)
+# Data Contoh dan Fungsi Backend (Tidak Berubah)
 # =============================================================================
-# Data dari file CSV Anda disematkan di sini sebagai data contoh.
+R_GAS_CONSTANT = 8.314
 sample_csv_data = """Time,Fraction
 0,0
 9.424369748,0.043697479
@@ -29,142 +30,207 @@ sample_csv_data = """Time,Fraction
 84.81932773,0.998319328
 """
 
-# =============================================================================
-# Logika Fungsi Model (Backend) - Sekarang dengan Caching untuk Performa
-# =============================================================================
-R_GAS_CONSTANT = 8.314
-
-# @st.cache_data akan menyimpan hasil fungsi. Jika input sama, tidak perlu hitung ulang.
-@st.cache_data
+# Fungsi kalkulasi model (bisa di-cache di Dash, tapi kita sederhanakan dulu)
 def calculate_avrami(n, k, t_points=500):
-    """Menghitung model Avrami."""
-    if k <= 1e-9 or n <= 1e-9:
-        return np.array([0]), np.array([0])
+    if k <= 1e-9 or n <= 1e-9: return np.array([0]), np.array([0])
     t_max = ((-np.log(1 - 0.99)) / k)**(1 / n)
     t = np.linspace(0, t_max * 1.1, t_points)
     y = 1 - np.exp(-k * (t**n))
     return t, y
 
-@st.cache_data
 def calculate_weibull(T_val, b_val, t_points=500):
-    """Menghitung model Weibull."""
-    if T_val <= 1e-9 or b_val <= 1e-9:
-        return np.array([0]), np.array([0])
+    if T_val <= 1e-9 or b_val <= 1e-9: return np.array([0]), np.array([0])
     t_max = T_val * (-np.log(1 - 0.99))**(1 / b_val)
     t = np.linspace(0, t_max * 1.1, t_points)
     y = 1 - np.exp(-(t / T_val)**b_val)
     return t, y
 
-@st.cache_data
 def calculate_sbm(A, Ea, T, m, n):
-    """Menghitung model SBM (Šesták-Berggren model)."""
     k = A * np.exp(-Ea / (R_GAS_CONSTANT * T))
     def sbm_ode(t, alpha):
         alpha_clipped = np.clip(alpha, 1e-9, 1 - 1e-9)
         return k * (alpha_clipped**m) * ((1 - alpha_clipped)**n)
-    
-    def reach_99(t, y):
-        return y[0] - 0.99
+    reach_99 = lambda t, y: y[0] - 0.99
     reach_99.terminal = True
-
     sol = solve_ivp(sbm_ode, [0, 5000], [1e-9], dense_output=True, events=reach_99)
     return sol.t, sol.y[0]
 
-# Fungsi untuk memuat data juga di-cache
-@st.cache_data
-def load_data(data_source):
-    """Memuat data dari file yang diupload atau dari data contoh."""
-    df = pd.read_csv(data_source)
-    return df.iloc[:, 0].values, df.iloc[:, 1].values
-
-# =============================================================================
-# UI (User Interface) - Dibuat dengan Streamlit di Sidebar
-# =============================================================================
-st.sidebar.header("⚙️ Kontrol Model")
-
-model_selector = st.sidebar.selectbox(
-    "Pilih Model Kinetik",
-    ("Avrami", "Weibull", "SBM")
-)
-
-# Kontrol Parameter dinamis berdasarkan model yang dipilih
-params = {}
-if model_selector == "Avrami":
-    st.sidebar.subheader("Parameter Avrami")
-    params['n'] = st.sidebar.slider("Exponent (n)", 0.5, 5.0, 2.0, 0.01)
-    params['k'] = st.sidebar.slider("Rate Constant (k)", 0.01, 5.0, 0.5, 0.01)
-elif model_selector == "Weibull":
-    st.sidebar.subheader("Parameter Weibull")
-    params['T_val'] = st.sidebar.slider("Scale / Time (T)", 0.1, 100.0, 10.0, 0.1)
-    params['b_val'] = st.sidebar.slider("Shape (b)", 0.1, 10.0, 1.5, 0.01)
-else: # SBM
-    st.sidebar.subheader("Parameter SBM")
-    params['A'] = st.sidebar.number_input("Pre-exponential (A)", min_value=1e1, max_value=1e25, value=1e10, format="%e")
-    params['Ea'] = st.sidebar.number_input("Activation Energy (Ea) J/mol", min_value=1000, max_value=500000, value=80000, step=1000)
-    params['T'] = st.sidebar.slider("Temperature (T) K", 273.0, 1500.0, 500.0, 1.0)
-    params['m'] = st.sidebar.slider("Exponent (m)", 0.0, 5.0, 1.0, 0.01)
-    params['n'] = st.sidebar.slider("Exponent (n)", 0.0, 5.0, 1.0, 0.01)
-
-# Opsi untuk menggunakan data contoh atau upload file sendiri
-st.sidebar.header("📊 Data Eksperimental")
-use_sample_data = st.sidebar.checkbox("Gunakan Data Contoh", value=True)
-
-uploaded_file = None
-if not use_sample_data:
-    uploaded_file = st.sidebar.file_uploader("Upload File CSV Anda", type=["csv"])
-
-# =============================================================================
-# Logika Plotting (Backend + Frontend)
-# =============================================================================
-fig, ax = plt.subplots(figsize=(10, 6))
-
-# Hitung kurva model berdasarkan input dari sidebar
-try:
-    if model_selector == "Avrami":
-        t_model, y_model = calculate_avrami(params['n'], params['k'])
-    elif model_selector == "Weibull":
-        t_model, y_model = calculate_weibull(params['T_val'], params['b_val'])
-    else: # SBM
-        t_model, y_model = calculate_sbm(params['A'], params['Ea'], params['T'], params['m'], params['n'])
-    
-    if len(t_model) > 1:
-        ax.plot(t_model, y_model, lw=2.5, color="royalblue", label=f"Model ({model_selector})")
-        ax.set_xlim(0, t_model[-1] * 1.05 if t_model[-1] > 0 else 1)
-except Exception as e:
-    st.error(f"Terjadi error saat menghitung model: {e}")
-
-# Tentukan sumber data (contoh atau upload)
-data_source = None
-if use_sample_data:
-    data_source = io.StringIO(sample_csv_data)
-elif uploaded_file is not None:
-    data_source = uploaded_file
-
-# Plot data eksperimental jika sumber data tersedia
-if data_source:
+def parse_contents(contents, filename):
+    """Fungsi untuk memproses file upload."""
+    content_type, content_string = contents.split(',')
+    decoded = base64.b64decode(content_string)
     try:
-        time_exp, fraction_exp = load_data(data_source)
-        ax.scatter(time_exp, fraction_exp, s=40, color='red', alpha=0.7, label="Data Eksperimental", zorder=5, edgecolors='black')
+        df = pd.read_csv(io.StringIO(decoded.decode('utf-8')))
+        return df.iloc[:, 0].values, df.iloc[:, 1].values
     except Exception as e:
-        st.error(f"Gagal memproses file data: {e}")
+        print(e)
+        return None, None
 
-# Pengaturan Tampilan Plot
-ax.set_title("Perbandingan Model Kinetik dengan Data Eksperimental", fontsize=16)
-ax.set_xlabel("Waktu (t)", fontsize=12)
-ax.set_ylabel("Fraksi Transformasi (α)", fontsize=12)
-ax.set_ylim(-0.05, 1.1)
-ax.grid(True, linestyle='--', alpha=0.6)
-ax.legend()
+# =============================================================================
+# Layout Aplikasi Dash
+# =============================================================================
+app.layout = html.Div(style={'fontFamily': 'sans-serif'}, children=[
+    # Kolom Kontrol (Sidebar)
+    html.Div(style={'width': '24%', 'float': 'left', 'padding': '1%'}, children=[
+        html.H2("⚙️ Kontrol Model"),
+        html.Hr(),
+        html.P("Pilih Model Kinetik:"),
+        dcc.Dropdown(
+            id='model-selector',
+            options=[
+                {'label': 'Avrami', 'value': 'avrami'},
+                {'label': 'Weibull', 'value': 'weibull'},
+                {'label': 'SBM', 'value': 'sbm'}
+            ],
+            value='avrami',
+            clearable=False
+        ),
 
-# --- Menambahkan Watermark ---
-fig.text(0.5, 0.5, 'JeryThom program',
-         fontsize=50,
-         color='gray',
-         ha='center', # horizontal alignment
-         va='center', # vertical alignment
-         alpha=0.15,  # transparansi
-         rotation=30) # rotasi watermark
+        # Panel Parameter (ditampilkan/disembunyikan secara dinamis)
+        html.Div(id='panel-avrami', children=[
+            html.H5("Parameter Avrami", style={'marginTop': '20px'}),
+            html.P("Exponent (n)"),
+            dcc.Slider(id='n-avrami', min=0.5, max=5.0, value=2.0, step=0.01, marks={i: str(i) for i in range(1, 6)}),
+            html.P("Rate Constant (k)"),
+            dcc.Slider(id='k-avrami', min=0.01, max=5.0, value=0.5, step=0.01, marks={i: str(i) for i in range(1, 6)}),
+        ]),
+        html.Div(id='panel-weibull', style={'display': 'none'}, children=[
+            html.H5("Parameter Weibull", style={'marginTop': '20px'}),
+            html.P("Scale / Time (T)"),
+            dcc.Slider(id='T-weibull', min=0.1, max=100.0, value=10.0, step=0.1),
+            html.P("Shape (b)"),
+            dcc.Slider(id='b-weibull', min=0.1, max=10.0, value=1.5, step=0.01),
+        ]),
+        html.Div(id='panel-sbm', style={'display': 'none'}, children=[
+            html.H5("Parameter SBM", style={'marginTop': '20px'}),
+            html.P("Pre-exponential (A)"),
+            dcc.Input(id='A-sbm', type='number', value=1e10, style={'width':'100%'}),
+            html.P("Activation Energy (Ea) J/mol", style={'marginTop': '10px'}),
+            dcc.Input(id='Ea-sbm', type='number', value=80000, step=1000, style={'width':'100%'}),
+            html.P("Temperature (T) K", style={'marginTop': '10px'}),
+            dcc.Slider(id='T-sbm', min=273, max=1500, value=500, step=1),
+            html.P("Exponent (m)", style={'marginTop': '10px'}),
+            dcc.Slider(id='m-sbm', min=0, max=5, value=1.0, step=0.01),
+            html.P("Exponent (n)", style={'marginTop': '10px'}),
+            dcc.Slider(id='n-sbm', min=0, max=5, value=1.0, step=0.01),
+        ]),
+        
+        html.Hr(style={'marginTop': '20px'}),
+        html.H4("📊 Data Eksperimental"),
+        dcc.Checklist(
+            id='sample-data-checklist',
+            options=[{'label': ' Gunakan Data Contoh', 'value': 'use_sample'}],
+            value=['use_sample']
+        ),
+        dcc.Upload(
+            id='upload-data',
+            children=html.Div(['Drag and Drop atau ', html.A('Pilih File CSV')]),
+            style={
+                'width': '100%', 'height': '60px', 'lineHeight': '60px',
+                'borderWidth': '1px', 'borderStyle': 'dashed',
+                'borderRadius': '5px', 'textAlign': 'center', 'margin': '10px 0'
+            },
+        )
+    ]),
 
-# Tampilkan plot di aplikasi Streamlit
-st.pyplot(fig)
+    # Kolom Grafik Utama
+    html.Div(style={'width': '74%', 'float': 'right', 'padding': '1%'}, children=[
+        html.H1("🔬 Universal Kinetic Modeler"),
+        html.P("Aplikasi web interaktif untuk memodelkan data kinetik transformasi. Dibuat oleh JeryThom."),
+        dcc.Graph(id='kinetic-graph')
+    ])
+])
+
+# =============================================================================
+# Callbacks untuk Interaktivitas
+# =============================================================================
+
+# Callback 1: Mengatur panel kontrol mana yang terlihat
+@app.callback(
+    Output('panel-avrami', 'style'),
+    Output('panel-weibull', 'style'),
+    Output('panel-sbm', 'style'),
+    Input('model-selector', 'value')
+)
+def toggle_parameter_panels(model):
+    if model == 'avrami':
+        return {'display': 'block'}, {'display': 'none'}, {'display': 'none'}
+    elif model == 'weibull':
+        return {'display': 'none'}, {'display': 'block'}, {'display': 'none'}
+    elif model == 'sbm':
+        return {'display': 'none'}, {'display': 'none'}, {'display': 'block'}
+
+# Callback 2: Callback utama untuk memperbarui grafik
+@app.callback(
+    Output('kinetic-graph', 'figure'),
+    # Input dari semua kontrol
+    Input('model-selector', 'value'),
+    Input('n-avrami', 'value'), Input('k-avrami', 'value'),
+    Input('T-weibull', 'value'), Input('b-weibull', 'value'),
+    Input('A-sbm', 'value'), Input('Ea-sbm', 'value'), Input('T-sbm', 'value'), 
+    Input('m-sbm', 'value'), Input('n-sbm', 'value'),
+    Input('sample-data-checklist', 'value'),
+    Input('upload-data', 'contents'),
+    State('upload-data', 'filename')
+)
+def update_graph(model, n_av, k_av, T_we, b_we, A_sbm, Ea_sbm, T_sbm, m_sbm, n_sbm,
+                 checklist_value, upload_contents, upload_filename):
+    
+    fig = go.Figure()
+    
+    # 1. Tentukan dan plot data eksperimental
+    time_exp, frac_exp = None, None
+    if 'use_sample' in checklist_value:
+        df = pd.read_csv(io.StringIO(sample_csv_data))
+        time_exp, frac_exp = df.iloc[:, 0].values, df.iloc[:, 1].values
+    elif upload_contents is not None:
+        time_exp, frac_exp = parse_contents(upload_contents, upload_filename)
+
+    if time_exp is not None and frac_exp is not None:
+        fig.add_trace(go.Scatter(
+            x=time_exp, y=frac_exp, mode='markers', name='Data Eksperimental',
+            marker=dict(color='red', size=8, symbol='circle-open')
+        ))
+
+    # 2. Hitung dan plot kurva model
+    t_model, y_model = [], []
+    if model == 'avrami':
+        t_model, y_model = calculate_avrami(n_av, k_av)
+    elif model == 'weibull':
+        t_model, y_model = calculate_weibull(T_we, b_we)
+    elif model == 'sbm':
+        t_model, y_model = calculate_sbm(A_sbm, Ea_sbm, T_sbm, m_sbm, n_sbm)
+
+    fig.add_trace(go.Scatter(
+        x=t_model, y=y_model, mode='lines', name=f'Model ({model.upper()})',
+        line=dict(color='royalblue', width=3)
+    ))
+
+    # 3. Atur layout, judul, dan watermark
+    fig.update_layout(
+        title_text='Perbandingan Model Kinetik dengan Data Eksperimental',
+        xaxis_title='Waktu (t)',
+        yaxis_title='Fraksi Transformasi (α)',
+        yaxis_range=[-0.05, 1.1],
+        legend=dict(yanchor="top", y=0.98, xanchor="left", x=0.02),
+        template='plotly_white',
+        annotations=[
+            go.layout.Annotation(
+                text="JeryThom program",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5,
+                showarrow=False,
+                font=dict(size=50, color="rgba(128, 128, 128, 0.2)"),
+                textangle=-30
+            )
+        ]
+    )
+    
+    return fig
+
+# =============================================================================
+# Menjalankan Aplikasi
+# =============================================================================
+if __name__ == '__main__':
+    app.run_server(debug=True)
 
