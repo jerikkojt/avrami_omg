@@ -234,5 +234,5 @@ def update_graph(model, n_av, k_av, T_we, b_we, A_sbm, Ea_sbm, T_sbm, m_sbm, n_s
 # Menjalankan Aplikasi
 # =============================================================================
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=False)
 
